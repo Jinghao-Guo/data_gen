@@ -7,6 +7,14 @@ Scripts for human-image data generation, including:
 - target image generation with FireRed
 - parquet filtering and mixing utilities
 
+## Environment
+
+Install the Python dependencies with:
+
+```bash
+pip install -r requirements.txt
+```
+
 ## Main scripts
 
 - `balanced_sample_image_paths.py`: sample image paths evenly across immediate subdirectories
