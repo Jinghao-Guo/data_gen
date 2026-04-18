@@ -19,6 +19,7 @@ pip install -r requirements.txt
 
 - `balanced_sample_image_paths.py`: sample image paths evenly across immediate subdirectories
 - `generate_instructions.py`: generate edit instructions and write resolution-sharded parquet outputs
+- `generate_text_change_instructions.py`: generate text-change instructions following GEdit-Bench-style category ratios
 - `generate_target_images.py`: generate edited target images with multi-GPU and multi-machine support
 - `extract_parquet_fraction.py`: take a fraction of a parquet file
 - `mix_edit_parquets.py`: merge or mix parquet datasets
