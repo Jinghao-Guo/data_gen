@@ -344,8 +344,23 @@ def process_batch(
         width=width,
         height=height,
     )
-    with torch.inference_mode():
-        result = pipeline(**inputs)
+    try:
+        with torch.inference_mode():
+            result = pipeline(**inputs)
+    except ValueError as exc:
+        if len(rows) > 1 and "only supports batch_size=1" in str(exc):
+            if not getattr(process_batch, "_warned_batch_size_one_only", False):
+                print(
+                    "WARNING: current QwenImageEditPlusPipeline build only supports "
+                    "batch_size=1; falling back to per-image inference.",
+                    flush=True,
+                )
+                process_batch._warned_batch_size_one_only = True
+            records: list[dict[str, Any]] = []
+            for row in rows:
+                records.extend(process_batch(pipeline, device, [row], args, num_inference_steps))
+            return records
+        raise
 
     if len(result.images) != len(rows):
         raise RuntimeError(
