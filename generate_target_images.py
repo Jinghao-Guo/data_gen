@@ -44,13 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-parquet", type=Path, default=DEFAULT_OUTPUT_PARQUET)
     parser.add_argument("--parquet-base-dir", type=Path, default=DEFAULT_PARQUET_BASE_DIR)
     parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_CHECKPOINT_DIR)
-    parser.add_argument("--num-gpus", type=int, default=8, help="Number of visible GPUs to use.")
-    parser.add_argument(
-        "--processes-per-gpu",
-        type=int,
-        default=1,
-        help="Number of worker processes to launch on each GPU.",
-    )
+    parser.add_argument("--num-gpus", type=int, default=8, help="Number of GPU worker processes.")
     parser.add_argument(
         "--rank",
         type=int,
@@ -193,24 +187,16 @@ def get_target_relpath(row_idx: int) -> Path:
     return Path(subdir) / filename
 
 
-def local_worker_count(args: argparse.Namespace) -> int:
-    return args.num_gpus * args.processes_per_gpu
-
-
-def device_index_for_worker(args: argparse.Namespace, local_worker_rank: int) -> int:
-    return local_worker_rank // args.processes_per_gpu
-
-
 def total_worker_count(args: argparse.Namespace) -> int:
-    return args.world_size * local_worker_count(args)
+    return args.world_size * args.num_gpus
 
 
-def global_worker_rank(args: argparse.Namespace, local_worker_rank: int) -> int:
-    return args.rank * local_worker_count(args) + local_worker_rank
+def global_worker_rank(args: argparse.Namespace, local_rank: int) -> int:
+    return args.rank * args.num_gpus + local_rank
 
 
-def checkpoint_path(args: argparse.Namespace, local_worker_rank: int) -> Path:
-    global_rank = global_worker_rank(args, local_worker_rank)
+def checkpoint_path(args: argparse.Namespace, local_rank: int) -> Path:
+    global_rank = global_worker_rank(args, local_rank)
     global_workers = total_worker_count(args)
     return args.checkpoint_dir / f"done_{global_rank:04d}_of_{global_workers:04d}.jsonl"
 
@@ -224,8 +210,8 @@ def output_parquet_path(args: argparse.Namespace) -> Path:
     )
 
 
-def select_worker_rows(assignments: pd.DataFrame, args: argparse.Namespace, local_worker_rank: int) -> pd.DataFrame:
-    global_rank = global_worker_rank(args, local_worker_rank)
+def select_worker_rows(assignments: pd.DataFrame, args: argparse.Namespace, local_rank: int) -> pd.DataFrame:
+    global_rank = global_worker_rank(args, local_rank)
     global_workers = total_worker_count(args)
     return assignments.iloc[global_rank::global_workers].copy()
 
@@ -425,10 +411,9 @@ def iter_resolution_batches(rows: pd.DataFrame, batch_size: int):
         yield current_batch
 
 
-def worker_main(local_worker_rank: int, args: argparse.Namespace) -> None:
-    device_index = device_index_for_worker(args, local_worker_rank)
-    device = f"cuda:{device_index}"
-    global_rank = global_worker_rank(args, local_worker_rank)
+def worker_main(rank: int, args: argparse.Namespace) -> None:
+    device = f"cuda:{rank}"
+    global_rank = global_worker_rank(args, rank)
     global_workers = total_worker_count(args)
     model_spec = resolve_model_spec(args.model)
     num_inference_steps = (
@@ -437,11 +422,11 @@ def worker_main(local_worker_rank: int, args: argparse.Namespace) -> None:
         else model_spec.recommended_num_inference_steps
     )
     assignments = load_assignments(args.input_parquet)
-    worker_rows = select_worker_rows(assignments, args, local_worker_rank)
+    worker_rows = select_worker_rows(assignments, args, rank)
 
     args.output_image_root.mkdir(parents=True, exist_ok=True)
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    done_path = checkpoint_path(args, local_worker_rank)
+    done_path = checkpoint_path(args, rank)
     completed = (
         load_completed_records(done_path, args.output_image_root) if args.resume else {}
     )
@@ -449,15 +434,13 @@ def worker_main(local_worker_rank: int, args: argparse.Namespace) -> None:
 
     if pending_rows.empty:
         print(
-            f"[worker {local_worker_rank} gpu {device_index} global {global_rank}/{global_workers}] "
-            f"nothing to do on {device} | "
+            f"[rank {rank} global {global_rank}/{global_workers}] nothing to do on {device} | "
             f"rows={len(worker_rows)} completed={len(completed)}"
         )
         return
 
     print(
-        f"[worker {local_worker_rank} gpu {device_index} global {global_rank}/{global_workers}] "
-        f"loading pipeline on {device} | "
+        f"[rank {rank} global {global_rank}/{global_workers}] loading pipeline on {device} | "
         f"rows={len(worker_rows)} pending={len(pending_rows)} "
         f"completed={len(completed)} optimized={args.optimized} "
         f"steps={num_inference_steps}"
@@ -490,8 +473,7 @@ def worker_main(local_worker_rank: int, args: argparse.Namespace) -> None:
             batch_width = int(batch_rows[0].width)
             batch_height = int(batch_rows[0].height)
             print(
-                f"[worker {local_worker_rank} gpu {device_index} global {global_rank}/{global_workers}] "
-                f"processed={processed} "
+                f"[rank {rank} global {global_rank}/{global_workers}] processed={processed} "
                 f"batches={processed_batches} "
                 f"last_batch={len(batch_rows)}@{batch_width}x{batch_height} "
                 f"elapsed={elapsed:.1f}s speed={speed:.2f} img/s"
@@ -504,13 +486,13 @@ def worker_main(local_worker_rank: int, args: argparse.Namespace) -> None:
 def merge_records(args: argparse.Namespace) -> None:
     assignments = load_assignments(args.input_parquet)
     valid_row_ids: set[int] = set()
-    for local_worker_rank in range(local_worker_count(args)):
-        worker_rows = select_worker_rows(assignments, args, local_worker_rank)
+    for local_rank in range(args.num_gpus):
+        worker_rows = select_worker_rows(assignments, args, local_rank)
         valid_row_ids.update(worker_rows["row_idx"].tolist())
     merged: dict[int, dict[str, Any]] = {}
 
-    for local_worker_rank in range(local_worker_count(args)):
-        done_path = checkpoint_path(args, local_worker_rank)
+    for local_rank in range(args.num_gpus):
+        done_path = checkpoint_path(args, local_rank)
         records = load_completed_records(done_path, args.output_image_root)
         for row_idx, record in records.items():
             if row_idx not in valid_row_ids:
@@ -560,8 +542,6 @@ def main() -> None:
         raise ValueError("--log-every must be a positive integer.")
     if args.num_gpus <= 0:
         raise ValueError("--num-gpus must be a positive integer.")
-    if args.processes_per_gpu <= 0:
-        raise ValueError("--processes-per-gpu must be a positive integer.")
     if args.world_size <= 0:
         raise ValueError("--world-size must be a positive integer.")
     if not 0 <= args.rank < args.world_size:
@@ -573,7 +553,7 @@ def main() -> None:
             f"Requested {args.num_gpus} GPUs, but only {available_gpus} are available."
         )
 
-    mp.spawn(worker_main, args=(args,), nprocs=local_worker_count(args), join=True)
+    mp.spawn(worker_main, args=(args,), nprocs=args.num_gpus, join=True)
     merge_records(args)
 
 
